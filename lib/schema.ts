@@ -1,49 +1,55 @@
 import { z } from "zod";
 
 function normalizeGoalText(value: string): string {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
-function getGoalMatchScore(label: string, goal: string): number {
-  const normalizedLabel = normalizeGoalText(label);
+function getGoalMatchScore(value: string, goal: string): number {
+  const normalizedValue = normalizeGoalText(value);
   const normalizedGoal = normalizeGoalText(goal);
 
-  if (!normalizedLabel || !normalizedGoal) {
+  if (!normalizedValue || !normalizedGoal) {
     return 0;
   }
 
-  if (normalizedLabel === normalizedGoal) {
-    return 100;
+  if (normalizedValue === normalizedGoal) {
+    return 1;
   }
 
-  const labelTokens = new Set(normalizedLabel.split(" "));
-  const goalTokens = new Set(normalizedGoal.split(" "));
-  const allTokens = new Set([...labelTokens, ...goalTokens]);
-  const overlap = [...labelTokens].filter((token) => goalTokens.has(token)).length;
-  const containmentScore =
-    normalizedLabel.includes(normalizedGoal) || normalizedGoal.includes(normalizedLabel)
-      ? 50
-      : 0;
+  if (
+    normalizedValue.includes(normalizedGoal) ||
+    normalizedGoal.includes(normalizedValue)
+  ) {
+    return 0.9 +
+      (0.1 * Math.min(normalizedValue.length, normalizedGoal.length)) /
+        Math.max(normalizedValue.length, normalizedGoal.length);
+  }
 
-  return containmentScore + overlap / allTokens.size;
-}
+  if (normalizedValue.length < 2 || normalizedGoal.length < 2) {
+    return 0;
+  }
 
-function findGoalNode(
-  nodes: Array<{ id: string; label: string }>,
-  goal: string,
-): { id: string; label: string } | undefined {
-  return nodes.reduce<{ node: { id: string; label: string }; score: number } | undefined>(
-    (best, node) => {
-      const score = getGoalMatchScore(node.label, goal);
+  const valueBigrams = new Map<string, number>();
+  for (let index = 0; index < normalizedValue.length - 1; index += 1) {
+    const bigram = normalizedValue.slice(index, index + 2);
+    valueBigrams.set(bigram, (valueBigrams.get(bigram) ?? 0) + 1);
+  }
 
-      if (!best || score > best.score) {
-        return { node, score };
-      }
+  let sharedBigrams = 0;
+  for (let index = 0; index < normalizedGoal.length - 1; index += 1) {
+    const bigram = normalizedGoal.slice(index, index + 2);
+    const available = valueBigrams.get(bigram) ?? 0;
 
-      return best;
-    },
-    undefined,
-  )?.node;
+    if (available > 0) {
+      sharedBigrams += 1;
+      valueBigrams.set(bigram, available - 1);
+    }
+  }
+
+  return (
+    (2 * sharedBigrams) /
+    (normalizedValue.length - 1 + (normalizedGoal.length - 1))
+  );
 }
 
 function getEdgeKey(edge: SkillEdge): string {
@@ -145,37 +151,84 @@ export type SkillNode = z.infer<typeof SkillNodeSchema>;
 export type SkillEdge = z.infer<typeof SkillEdgeSchema>;
 export type SkillGraph = z.infer<typeof SkillGraphBaseSchema>;
 
+export function identifyGoalNode(graph: SkillGraph): SkillNode | undefined {
+  const nodeIds = new Set(graph.nodes.map((node) => node.id));
+  const edges = getSanitizedEdges(graph.edges, nodeIds);
+  const outgoingCounts = getOutgoingCounts(graph.nodes, edges);
+  const sinks = graph.nodes.filter(
+    (node) => (outgoingCounts.get(node.id) ?? 0) === 0,
+  );
+
+  if (sinks.length === 0) {
+    return graph.nodes.reduce<{ node: SkillNode; score: number } | undefined>(
+      (best, node) => {
+        const score = getGoalMatchScore(node.label, graph.goal);
+        return !best || score > best.score ? { node, score } : best;
+      },
+      undefined,
+    )?.node;
+  }
+
+  const bestSinkMatch = sinks.reduce<
+    { node: SkillNode; score: number } | undefined
+  >((best, node) => {
+    const score = Math.max(
+      getGoalMatchScore(node.label, graph.goal),
+      getGoalMatchScore(node.id, graph.goal),
+    );
+    return !best || score > best.score ? { node, score } : best;
+  }, undefined);
+
+  if (bestSinkMatch && bestSinkMatch.score > 0) {
+    return bestSinkMatch.node;
+  }
+
+  const incomingCounts = new Map(graph.nodes.map((node) => [node.id, 0]));
+  edges.forEach((edge) => {
+    incomingCounts.set(edge.target, (incomingCounts.get(edge.target) ?? 0) + 1);
+  });
+
+  return sinks.reduce<SkillNode | undefined>((best, node) => {
+    if (!best) {
+      return node;
+    }
+
+    return (incomingCounts.get(node.id) ?? 0) >
+      (incomingCounts.get(best.id) ?? 0)
+      ? node
+      : best;
+  }, undefined);
+}
+
 export function repairGraph(graph: SkillGraph): SkillGraph {
   const nodeIds = new Set(graph.nodes.map((node) => node.id));
   const structurallyUsableEdges = getSanitizedEdges(graph.edges, nodeIds);
-  const initialOutgoingCounts = getOutgoingCounts(
-    graph.nodes,
-    structurallyUsableEdges,
-  );
-  const initialSinks = graph.nodes.filter(
-    (node) => (initialOutgoingCounts.get(node.id) ?? 0) === 0,
-  );
-  const goalSink =
-    (initialSinks.length > 0
-      ? findGoalNode(initialSinks, graph.goal)
-      : undefined) ?? graph.nodes[graph.nodes.length - 1];
+  const goalNode = identifyGoalNode({
+    ...graph,
+    edges: structurallyUsableEdges,
+  }) ?? graph.nodes[graph.nodes.length - 1];
 
-  let edges = graph.edges.map((edge) =>
-    edge.source === goalSink.id
+  let edges = structurallyUsableEdges.map((edge) =>
+    edge.source === goalNode.id
       ? { ...edge, source: edge.target, target: edge.source }
       : edge,
   );
 
-  initialSinks.forEach((sink) => {
-    if (sink.id !== goalSink.id) {
-      edges.push({ source: sink.id, target: goalSink.id, type: "requires" });
+  edges = getSanitizedEdges(edges, nodeIds);
+  const outgoingCounts = getOutgoingCounts(graph.nodes, edges);
+  graph.nodes.forEach((node) => {
+    if (
+      node.id !== goalNode.id &&
+      (outgoingCounts.get(node.id) ?? 0) === 0
+    ) {
+      edges.push({ source: node.id, target: goalNode.id, type: "requires" });
     }
   });
 
   edges = getSanitizedEdges(edges, nodeIds);
 
   for (let attempt = 0; attempt < graph.nodes.length; attempt += 1) {
-    const reachableNodeIds = getReachableNodeIds(graph.nodes, edges, goalSink.id);
+    const reachableNodeIds = getReachableNodeIds(graph.nodes, edges, goalNode.id);
     const unreachableNodes = graph.nodes.filter(
       (node) => !reachableNodeIds.has(node.id),
     );
@@ -197,16 +250,32 @@ export function repairGraph(graph: SkillGraph): SkillGraph {
     edges = getSanitizedEdges(
       [
         ...edges,
-        { source: islandSink.id, target: goalSink.id, type: "requires" },
+        { source: islandSink.id, target: goalNode.id, type: "requires" },
       ],
       nodeIds,
     );
   }
 
-  return {
+  const repairedGraph = {
     ...graph,
     edges,
   };
+  const repairedOutgoingCounts = getOutgoingCounts(graph.nodes, edges);
+  const repairedSinks = graph.nodes.filter(
+    (node) => (repairedOutgoingCounts.get(node.id) ?? 0) === 0,
+  );
+
+  if (
+    repairedSinks.length > 1 ||
+    (repairedOutgoingCounts.get(goalNode.id) ?? 0) > 0
+  ) {
+    console.error(
+      "repairGraph invariant failed:",
+      JSON.stringify(repairedGraph, null, 2),
+    );
+  }
+
+  return repairedGraph;
 }
 
 export const SkillGraphSchema = SkillGraphBaseSchema.superRefine((graph, ctx) => {
@@ -243,12 +312,10 @@ export const SkillGraphSchema = SkillGraphBaseSchema.superRefine((graph, ctx) =>
       }
     });
 
-    const validEdges = graph.edges.filter(
-      (edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target),
-    );
+    const validEdges = getSanitizedEdges(graph.edges, nodeIds);
     const outgoingCounts = getOutgoingCounts(graph.nodes, validEdges);
 
-    const goalNode = findGoalNode(graph.nodes, graph.goal);
+    const goalNode = identifyGoalNode({ ...graph, edges: validEdges });
     const sinks = graph.nodes.filter(
       (node) => (outgoingCounts.get(node.id) ?? 0) === 0,
     );

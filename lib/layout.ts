@@ -2,13 +2,21 @@ import ELK, {
   type ElkExtendedEdge,
   type ElkNode,
 } from "elkjs/lib/elk.bundled.js";
-import type { Edge, Node } from "reactflow";
+import { MarkerType, type Edge, type Node } from "reactflow";
+import { darkenHexColor, getClusterTintMap } from "./clusters";
 import type { SkillEdge, SkillGraph, SkillNode } from "./schema";
 
-const NODE_WIDTH = 240;
-const NODE_HEIGHT = 92;
+export const NODE_WIDTH = 240;
+export const NODE_HEIGHT = 48;
 
-export type SkillFlowNode = Node<SkillNode>;
+export type SkillFlowNodeData = SkillNode & {
+  isGoal: boolean;
+  isPreReveal?: boolean;
+  revealDurationMs?: number;
+  clusterTint: string;
+};
+
+export type SkillFlowNode = Node<SkillFlowNodeData>;
 export type SkillFlowEdge = Edge<SkillEdge>;
 
 export type SkillFlowGraph = {
@@ -17,6 +25,66 @@ export type SkillFlowGraph = {
 };
 
 const elk = new ELK();
+
+function createElkGraph(
+  nodes: SkillNode[],
+  edges: SkillEdge[],
+  useModelOrder: boolean,
+): ElkNode {
+  return {
+    id: "root",
+    layoutOptions: {
+      "elk.algorithm": "layered",
+      "elk.direction": "DOWN",
+      "elk.spacing.nodeNode": "48",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "85",
+      "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
+      ...(useModelOrder
+        ? {
+            "elk.layered.considerModelOrder.strategy": "NODES_AND_EDGES",
+          }
+        : {}),
+    },
+    children: nodes.map((node) => ({
+      id: node.id,
+      width: NODE_WIDTH,
+      height: NODE_HEIGHT,
+    })),
+    edges: edges.map(
+      (edge, index): ElkExtendedEdge => ({
+        id: `${edge.source}-${edge.target}-${edge.type}-${index}`,
+        sources: [edge.source],
+        targets: [edge.target],
+      }),
+    ),
+  };
+}
+
+function getValidPositions(
+  layoutedGraph: ElkNode,
+  nodes: SkillNode[],
+): Map<string, { x: number; y: number }> {
+  const positions = new Map(
+    layoutedGraph.children?.map((node) => [
+      node.id,
+      { x: node.x, y: node.y },
+    ]),
+  );
+
+  nodes.forEach((node) => {
+    const position = positions.get(node.id);
+
+    if (
+      !position ||
+      !Number.isFinite(position.x) ||
+      !Number.isFinite(position.y)
+    ) {
+      throw new Error(`ELK returned an invalid position for node ${node.id}.`);
+    }
+  });
+
+  return positions as Map<string, { x: number; y: number }>;
+}
 
 export async function layoutSkillGraph(graph: SkillGraph): Promise<SkillFlowGraph> {
   const nodeIds = new Set(graph.nodes.map((node) => node.id));
@@ -34,55 +102,61 @@ export async function layoutSkillGraph(graph: SkillGraph): Promise<SkillFlowGrap
 
     return true;
   });
+  const outgoingNodeIds = new Set(validEdges.map((edge) => edge.source));
+  const clusterTints = getClusterTintMap(graph.nodes);
+  const nodesInClusterOrder = graph.nodes
+    .map((node, index) => ({ node, index }))
+    .sort(
+      (first, second) =>
+        first.node.cluster.localeCompare(second.node.cluster) ||
+        first.index - second.index,
+    )
+    .map(({ node }) => node);
 
-  const elkGraph: ElkNode = {
-    id: "root",
-    layoutOptions: {
-      "elk.algorithm": "layered",
-      "elk.direction": "DOWN",
-      "elk.spacing.nodeNode": "60",
-      "elk.layered.spacing.nodeNodeBetweenLayers": "120",
-    },
-    children: graph.nodes.map((node) => ({
-      id: node.id,
-      width: NODE_WIDTH,
-      height: NODE_HEIGHT,
-    })),
-    edges: validEdges.map(
-      (edge, index): ElkExtendedEdge => ({
-        id: `${edge.source}-${edge.target}-${edge.type}-${index}`,
-        sources: [edge.source],
-        targets: [edge.target],
-      }),
-    ),
-  };
-
-  const layoutedGraph = await elk.layout(elkGraph);
-  const positions = new Map(
-    layoutedGraph.children?.map((node) => [
-      node.id,
-      { x: node.x ?? 0, y: node.y ?? 0 },
-    ]),
-  );
+  let positions: Map<string, { x: number; y: number }>;
+  try {
+    const layoutedGraph = await elk.layout(
+      createElkGraph(nodesInClusterOrder, validEdges, true),
+    );
+    positions = getValidPositions(layoutedGraph, graph.nodes);
+  } catch {
+    const layoutedGraph = await elk.layout(
+      createElkGraph(graph.nodes, validEdges, false),
+    );
+    positions = getValidPositions(layoutedGraph, graph.nodes);
+  }
 
   return {
     nodes: graph.nodes.map((node) => ({
       id: node.id,
       position: positions.get(node.id) ?? { x: 0, y: 0 },
-      data: node,
-      type: "default",
+      data: {
+        ...node,
+        isGoal: !outgoingNodeIds.has(node.id),
+        clusterTint: darkenHexColor(clusterTints.get(node.cluster) ?? "#E8DFD0"),
+      },
+      type: "skill",
       style: {
         width: NODE_WIDTH,
-        minHeight: NODE_HEIGHT,
       },
     })),
     edges: validEdges.map((edge, index) => ({
       id: `${edge.source}-${edge.target}-${edge.type}-${index}`,
       source: edge.source,
       target: edge.target,
-      label: edge.type,
       data: edge,
-      animated: edge.type === "choice",
+      type: "default",
+      style: {
+        stroke: edge.type === "choice" ? "var(--ink-muted)" : "var(--line-faint)",
+        strokeWidth: 1.25,
+        strokeDasharray: edge.type === "choice" ? "5 4" : undefined,
+      },
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+        width: 12,
+        height: 12,
+        color: edge.type === "choice" ? "var(--ink-muted)" : "var(--line-faint)",
+      },
     })),
   };
 }
