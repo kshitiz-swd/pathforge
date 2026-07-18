@@ -151,6 +151,37 @@ export type SkillNode = z.infer<typeof SkillNodeSchema>;
 export type SkillEdge = z.infer<typeof SkillEdgeSchema>;
 export type SkillGraph = z.infer<typeof SkillGraphBaseSchema>;
 
+export const NodeContentSchema = z
+  .object({
+    overview: z.string().min(1),
+    project: z
+      .object({
+        title: z.string().min(1),
+        brief: z.string().min(1),
+      })
+      .strict(),
+    interviewQuestions: z.array(z.string().min(1)).length(5),
+    estimatedEffort: z.enum(["days", "weeks", "months"]),
+  })
+  .strict();
+
+export type NodeContent = z.infer<typeof NodeContentSchema>;
+
+export const ReshapeResponseSchema = z
+  .object({
+    states: z.array(
+      z
+        .object({
+          id: z.string().min(1),
+          state: z.enum(["mastered", "available", "locked"]),
+        })
+        .strict(),
+    ),
+  })
+  .strict();
+
+export type ReshapeResponse = z.infer<typeof ReshapeResponseSchema>;
+
 export function identifyGoalNode(graph: SkillGraph): SkillNode | undefined {
   const nodeIds = new Set(graph.nodes.map((node) => node.id));
   const edges = getSanitizedEdges(graph.edges, nodeIds);

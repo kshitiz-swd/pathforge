@@ -11,8 +11,7 @@ export const NODE_HEIGHT = 48;
 
 export type SkillFlowNodeData = SkillNode & {
   isGoal: boolean;
-  isPreReveal?: boolean;
-  revealDurationMs?: number;
+  revealDelayMs?: number;
   clusterTint: string;
 };
 
@@ -20,6 +19,7 @@ export type SkillFlowNode = Node<SkillFlowNodeData>;
 export type SkillFlowEdge = Edge<SkillEdge>;
 
 export type SkillFlowGraph = {
+  goal: string;
   nodes: SkillFlowNode[];
   edges: SkillFlowEdge[];
 };
@@ -127,6 +127,7 @@ export async function layoutSkillGraph(graph: SkillGraph): Promise<SkillFlowGrap
   }
 
   return {
+    goal: graph.goal,
     nodes: graph.nodes.map((node) => ({
       id: node.id,
       position: positions.get(node.id) ?? { x: 0, y: 0 },

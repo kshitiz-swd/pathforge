@@ -1,22 +1,29 @@
 "use client";
 
 import {
+  useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type FormEvent,
 } from "react";
 import ReactFlow, { Controls, type ReactFlowInstance } from "reactflow";
+import { NodePanel } from "@/components/NodePanel";
+import { ReshapeBar } from "@/components/ReshapeBar";
 import { SkillNode } from "@/components/SkillNode";
 import { TerritoryLayer } from "@/components/TerritoryLayer";
 import {
   layoutSkillGraph,
+  NODE_HEIGHT,
+  NODE_WIDTH,
   type SkillFlowEdge,
   type SkillFlowGraph,
   type SkillFlowNode,
   type SkillFlowNodeData,
 } from "@/lib/layout";
-import { SkillGraphSchema } from "@/lib/schema";
+import { recomputeNodeStates } from "@/lib/node-states";
+import { ReshapeResponseSchema, SkillGraphSchema } from "@/lib/schema";
 
 const nodeTypes = { skill: SkillNode };
 const edgeTypes = {};
@@ -38,20 +45,41 @@ const exampleGoals = [
 ];
 
 const LAYER_TOLERANCE = 24;
-const BLOOM_START_DELAY = 80;
 const LAYER_STAGGER = 120;
 const NODE_DURATION = 350;
-const GOAL_DURATION = 500;
+const EDGE_DURATION = 300;
+const EDGE_DELAY = 200;
 const MAX_NODE_JITTER = 60;
-const EDGE_PRE_REVEAL_CLASS = "map-edge--pre-reveal";
+const RESHAPE_STAGGER = 150;
+const MANY_STATE_CHANGES = 4;
+const MASTERY_STORAGE_PREFIX = "pathforge:mastered:";
 
-function removePreRevealClass(className: string | undefined): string | undefined {
-  const nextClassName = className
-    ?.split(/\s+/)
-    .filter((name) => name && name !== EDGE_PRE_REVEAL_CLASS)
-    .join(" ");
+function getMasteryStorageKey(goal: string): string {
+  return `${MASTERY_STORAGE_PREFIX}${goal}`;
+}
 
-  return nextClassName || undefined;
+function readPersistedMastery(goal: string): string[] {
+  try {
+    const value: unknown = JSON.parse(
+      window.localStorage.getItem(getMasteryStorageKey(goal)) ?? "[]",
+    );
+    return Array.isArray(value)
+      ? value.filter((id): id is string => typeof id === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistMastery(goal: string, masteredIds: Iterable<string>) {
+  try {
+    window.localStorage.setItem(
+      getMasteryStorageKey(goal),
+      JSON.stringify([...masteredIds]),
+    );
+  } catch {
+    // The state still updates when storage is unavailable.
+  }
 }
 
 function LoadingSequence({ active }: { active: boolean }) {
@@ -120,225 +148,362 @@ function getNodeLayers(nodes: SkillFlowNode[]): SkillFlowNode[][] {
 }
 
 function BloomMap({ graph }: { graph: SkillFlowGraph }) {
+  const [bloomTiming] = useState(() => {
+    const nodeDelays = new Map<string, number>();
+
+    getNodeLayers(graph.nodes).forEach((layer, layerIndex) => {
+      layer.forEach((node) => {
+        const jitter = Math.floor(Math.random() * (MAX_NODE_JITTER + 1));
+        const revealDelay = layerIndex * LAYER_STAGGER + jitter;
+        nodeDelays.set(node.id, revealDelay);
+      });
+    });
+
+    const edgeDelays = new Map(
+      graph.edges.map((edge) => [
+        edge.id,
+        Math.max(
+          nodeDelays.get(edge.source) ?? 0,
+          nodeDelays.get(edge.target) ?? 0,
+        ) + EDGE_DELAY,
+      ]),
+    );
+    const nodeCompleteAt = Math.max(0, ...nodeDelays.values()) + NODE_DURATION;
+    const edgeCompleteAt = Math.max(0, ...edgeDelays.values()) + EDGE_DURATION;
+
+    return {
+      nodeDelays,
+      edgeDelays,
+      completeAt: Math.max(nodeCompleteAt, edgeCompleteAt),
+    };
+  });
   const [nodes, setNodes] = useState<SkillFlowNode[]>(() =>
     graph.nodes.map((node) => ({
       ...node,
       data: {
         ...node.data,
-        isPreReveal: true,
-        revealDurationMs: node.data.isGoal ? GOAL_DURATION : NODE_DURATION,
+        revealDelayMs: bloomTiming.nodeDelays.get(node.id) ?? 0,
       },
     })),
   );
-  const [edges, setEdges] = useState<SkillFlowEdge[]>(() =>
+  const [edges] = useState<SkillFlowEdge[]>(() =>
     graph.edges.map((edge) => ({
       ...edge,
-      className: [edge.className, EDGE_PRE_REVEAL_CLASS]
-        .filter(Boolean)
-        .join(" "),
       style: {
         ...edge.style,
-        transition: "opacity 300ms ease-out",
+        animation: "edge-in 300ms ease-out backwards",
+        animationDelay: `${bloomTiming.edgeDelays.get(edge.id) ?? 0}ms`,
       },
     })),
   );
-  const [revealedClusters, setRevealedClusters] = useState<Set<string>>(
-    () => new Set(),
-  );
   const [isLegendExpanded, setIsLegendExpanded] = useState(true);
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const flowInstance = useRef<
     ReactFlowInstance<SkillFlowNodeData, SkillFlowEdge["data"]> | undefined
   >(undefined);
+  const selectedNodeIdRef = useRef<string | null>(null);
+  const reshapeTimeouts = useRef<number[]>([]);
+  const selectedNode = useMemo(
+    () => nodes.find((node) => node.id === selectedNodeId),
+    [nodes, selectedNodeId],
+  );
+  const prerequisiteLabels = useMemo(
+    () =>
+      selectedNodeId
+        ? graph.edges
+            .filter((edge) => edge.target === selectedNodeId)
+            .map(
+              (edge) =>
+                graph.nodes.find((node) => node.id === edge.source)?.data.label,
+            )
+            .filter((label): label is string => Boolean(label))
+        : [],
+    [graph.edges, graph.nodes, selectedNodeId],
+  );
 
-  useEffect(() => {
-    const timeouts: number[] = [];
-    const nodeAppearanceTimes = new Map<string, number>();
-    const nodeJitters = new Map<string, number>();
-    const layers = getNodeLayers(graph.nodes);
-    let bloomCompleteAt = 0;
+  const closeNodePanel = useCallback(() => {
+    selectedNodeIdRef.current = null;
+    setSelectedNodeId(null);
+    setNodes((currentNodes) =>
+      currentNodes.map((node) =>
+        node.selected ? { ...node, selected: false } : node,
+      ),
+    );
+  }, []);
 
-    layers.forEach((layer, layerIndex) => {
-      layer.forEach((node) => {
-        const jitter = Math.floor(Math.random() * (MAX_NODE_JITTER + 1));
-        nodeJitters.set(node.id, jitter);
-        const revealAt =
-          BLOOM_START_DELAY + layerIndex * LAYER_STAGGER + jitter;
-        const duration = node.data.isGoal ? GOAL_DURATION : NODE_DURATION;
-        const appearedAt = revealAt + duration;
+  function handleNodeClick(node: SkillFlowNode) {
+    selectedNodeIdRef.current = node.id;
+    setSelectedNodeId(node.id);
+    setNodes((currentNodes) =>
+      currentNodes.map((currentNode) => {
+        const isSelected = currentNode.id === node.id;
+        return currentNode.selected === isSelected
+          ? currentNode
+          : { ...currentNode, selected: isSelected };
+      }),
+    );
 
-        nodeAppearanceTimes.set(node.id, appearedAt);
-        bloomCompleteAt = Math.max(bloomCompleteAt, appearedAt);
-      });
-    });
-
-    function revealLayer(layerIndex: number) {
-      const layer = layers[layerIndex];
-      if (!layer) {
+    window.requestAnimationFrame(() => {
+      const instance = flowInstance.current;
+      if (!instance) {
         return;
       }
 
-      setRevealedClusters((currentClusters) => {
-        const nextClusters = new Set(currentClusters);
-        layer.forEach((node) => nextClusters.add(node.data.cluster));
-        return nextClusters;
-      });
-
-      layer.forEach((node) => {
-        timeouts.push(
-          window.setTimeout(() => {
-            setNodes((currentNodes) =>
-              currentNodes.map((currentNode) =>
-                currentNode.id === node.id
-                  ? {
-                      ...currentNode,
-                      data: { ...currentNode.data, isPreReveal: false },
-                    }
-                  : currentNode,
-              ),
-            );
-          }, 60 + (nodeJitters.get(node.id) ?? 0)),
-        );
-      });
-
-      if (layerIndex + 1 < layers.length) {
-        timeouts.push(
-          window.setTimeout(
-            () => revealLayer(layerIndex + 1),
-            LAYER_STAGGER,
-          ),
-        );
-      }
-    }
-
-    timeouts.push(
-      window.setTimeout(
-        () => revealLayer(0),
-        Math.max(0, BLOOM_START_DELAY - 60),
-      ),
-    );
-
-    graph.edges.forEach((edge) => {
-      const revealAt = Math.max(
-        nodeAppearanceTimes.get(edge.source) ?? 0,
-        nodeAppearanceTimes.get(edge.target) ?? 0,
-      );
-      bloomCompleteAt = Math.max(bloomCompleteAt, revealAt + 300);
-      timeouts.push(
-        window.setTimeout(() => {
-          setEdges((currentEdges) =>
-            currentEdges.map((currentEdge) =>
-              currentEdge.id === edge.id
-                ? {
-                    ...currentEdge,
-                    className: removePreRevealClass(currentEdge.className),
-                  }
-                : currentEdge,
-            ),
-          );
-        }, revealAt),
+      instance.setCenter(
+        node.position.x + NODE_WIDTH / 2,
+        node.position.y + NODE_HEIGHT / 2,
+        { zoom: instance.getZoom(), duration: 400 },
       );
     });
+  }
 
-    timeouts.push(
-      window.setTimeout(() => {
-        flowInstance.current?.fitView({ padding: 0.15, duration: 650 });
-      }, bloomCompleteAt),
+  function handleMasteryChange(nodeId: string, mastered: boolean) {
+    const targetNode = nodes.find((node) => node.id === nodeId);
+    if (!targetNode || targetNode.data.isGoal) {
+      return;
+    }
+
+    const masteredIds = new Set(
+      nodes
+        .filter((node) => node.data.state === "mastered")
+        .map((node) => node.id),
     );
 
-    return () => timeouts.forEach((timeout) => window.clearTimeout(timeout));
-  }, [graph]);
+    if (mastered) {
+      masteredIds.add(nodeId);
+    } else {
+      masteredIds.delete(nodeId);
+    }
+
+    const nextStates = new Map(
+      recomputeNodeStates(nodes.map((node) => node.data), graph.edges, masteredIds)
+        .map((entry) => [entry.id, entry.state]),
+    );
+
+    setNodes((currentNodes) =>
+      currentNodes.map((node) => {
+        const nextState = nextStates.get(node.id);
+        return nextState && nextState !== node.data.state
+          ? { ...node, data: { ...node.data, state: nextState } }
+          : node;
+      }),
+    );
+    persistMastery(graph.goal, masteredIds);
+  }
 
   useEffect(() => {
-    const safetyTimeout = window.setTimeout(() => {
-      setNodes((currentNodes) =>
-        currentNodes.map((node) => ({
-          ...node,
-          data: { ...node.data, isPreReveal: false },
-        })),
-      );
-      setEdges((currentEdges) =>
-        currentEdges.map((edge) => ({
-          ...edge,
-          className: removePreRevealClass(edge.className),
-        })),
-      );
-      setRevealedClusters(
-        new Set(graph.nodes.map((node) => node.data.cluster)),
-      );
-      flowInstance.current?.fitView({ padding: 0.15, duration: 300 });
-    }, 3000);
+    const frame = window.requestAnimationFrame(() => {
+      const persistedMastery = readPersistedMastery(graph.goal);
+      if (persistedMastery.length === 0) {
+        return;
+      }
 
-    return () => window.clearTimeout(safetyTimeout);
-  }, [graph]);
+      setNodes((currentNodes) => {
+        const existingMastery = currentNodes
+          .filter((node) => node.data.state === "mastered")
+          .map((node) => node.id);
+        const nextStates = new Map(
+          recomputeNodeStates(
+            currentNodes.map((node) => node.data),
+            graph.edges,
+            new Set([...existingMastery, ...persistedMastery]),
+          ).map((entry) => [entry.id, entry.state]),
+        );
+
+        return currentNodes.map((node) => {
+          const nextState = nextStates.get(node.id);
+          return nextState && nextState !== node.data.state
+            ? { ...node, data: { ...node.data, state: nextState } }
+            : node;
+        });
+      });
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [graph.edges, graph.goal]);
+
+  async function reshapeMap(knowledge: string) {
+    const response = await fetch("/api/reshape", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        goal: graph.goal,
+        knowledge,
+        graph: {
+          nodes: nodes.map((node) => ({
+            id: node.id,
+            label: node.data.label,
+            state: node.data.state,
+          })),
+          edges: graph.edges.map((edge) => ({
+            source: edge.source,
+            target: edge.target,
+            type: edge.data?.type ?? "requires",
+          })),
+        },
+      }),
+    });
+    const payload: unknown = await response.json();
+
+    if (!response.ok) {
+      const message =
+        typeof payload === "object" &&
+        payload !== null &&
+        "error" in payload &&
+        typeof payload.error === "string"
+          ? payload.error
+          : "The map could not be redrawn.";
+      throw new Error(message);
+    }
+
+    const result = ReshapeResponseSchema.parse(payload);
+    const currentStates = new Map(
+      nodes.map((node) => [node.id, node.data.state]),
+    );
+    const changedStates = result.states.filter(
+      (entry) => currentStates.get(entry.id) !== entry.state,
+    );
+    const orderedChanges = [
+      ...changedStates.filter((entry) => entry.state === "mastered"),
+      ...changedStates.filter((entry) => entry.state === "available"),
+      ...changedStates.filter((entry) => entry.state === "locked"),
+    ];
+
+    reshapeTimeouts.current.forEach((timeout) => window.clearTimeout(timeout));
+    reshapeTimeouts.current = orderedChanges.map((change, index) =>
+      window.setTimeout(() => {
+        setNodes((currentNodes) =>
+          currentNodes.map((node) =>
+            node.id === change.id
+              ? { ...node, data: { ...node.data, state: change.state } }
+              : node,
+          ),
+        );
+      }, index * RESHAPE_STAGGER),
+    );
+
+    if (orderedChanges.length >= MANY_STATE_CHANGES) {
+      reshapeTimeouts.current.push(
+        window.setTimeout(() => {
+          flowInstance.current?.fitView({ padding: 0.15, duration: 650 });
+        }, orderedChanges.length * RESHAPE_STAGGER + 250),
+      );
+    }
+  }
+
+  useEffect(
+    () => () => {
+      reshapeTimeouts.current.forEach((timeout) =>
+        window.clearTimeout(timeout),
+      );
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const prefersReducedMotion = window.matchMedia(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
+    const fitViewTimeout = window.setTimeout(
+      () => {
+        if (!selectedNodeIdRef.current) {
+          flowInstance.current?.fitView({
+            padding: 0.15,
+            duration: prefersReducedMotion ? 0 : 650,
+          });
+        }
+      },
+      prefersReducedMotion ? 0 : bloomTiming.completeAt,
+    );
+
+    return () => window.clearTimeout(fitViewTimeout);
+  }, [bloomTiming.completeAt]);
 
   return (
-    <ReactFlow
-      nodes={nodes}
-      edges={edges}
-      nodeTypes={nodeTypes}
-      edgeTypes={edgeTypes}
-      fitView
-      panOnDrag
-      zoomOnScroll
-      proOptions={proOptions}
-      className="h-full w-full"
-      onInit={(instance) => {
-        flowInstance.current = instance;
-      }}
-    >
-      <TerritoryLayer
-        nodes={graph.nodes}
-        revealedClusters={revealedClusters}
-      />
-      <Controls
-        className="map-controls"
-        position="bottom-left"
-        showFitView={false}
-        showInteractive={false}
-      />
-      <div
-        className={`map-legend${
-          isLegendExpanded ? "" : " map-legend--collapsed"
-        }`}
-        aria-label="Graph legend"
-      >
-        <button
-          type="button"
-          className="map-legend__toggle"
-          onClick={() => setIsLegendExpanded((expanded) => !expanded)}
-          aria-expanded={isLegendExpanded}
-          aria-label={isLegendExpanded ? "Collapse legend" : "Expand legend"}
-          title={isLegendExpanded ? "Collapse legend" : "Expand legend"}
+    <div className="map-shell">
+      <div className="map-canvas">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          fitView
+          panOnDrag
+          zoomOnScroll
+          proOptions={proOptions}
+          className="h-full w-full"
+          onInit={(instance) => {
+            flowInstance.current = instance;
+          }}
+          onNodeClick={(_event, node) => handleNodeClick(node)}
+          onPaneClick={closeNodePanel}
         >
-          ?
-        </button>
-        {isLegendExpanded ? (
-          <div className="map-legend__content">
-            <div className="map-legend__lines">
-              <div className="map-legend__row">
-                <span className="map-legend__line map-legend__line--solid" />
-                <span>required path</span>
+          <TerritoryLayer nodes={nodes} />
+          <Controls
+            className="map-controls"
+            position="bottom-left"
+            showFitView={false}
+            showInteractive={false}
+          />
+          <div
+            className={`map-legend${
+              isLegendExpanded ? "" : " map-legend--collapsed"
+            }`}
+            aria-label="Graph legend"
+          >
+            <button
+              type="button"
+              className="map-legend__toggle"
+              onClick={() => setIsLegendExpanded((expanded) => !expanded)}
+              aria-expanded={isLegendExpanded}
+              aria-label={
+                isLegendExpanded ? "Collapse legend" : "Expand legend"
+              }
+              title={isLegendExpanded ? "Collapse legend" : "Expand legend"}
+            >
+              ?
+            </button>
+            {isLegendExpanded ? (
+              <div className="map-legend__content">
+                <div className="map-legend__lines">
+                  <div className="map-legend__row">
+                    <span className="map-legend__line map-legend__line--solid" />
+                    <span>required path</span>
+                  </div>
+                  <div className="map-legend__row">
+                    <span className="map-legend__line map-legend__line--dashed" />
+                    <span>choose your route</span>
+                  </div>
+                </div>
+                <div className="map-legend__states">
+                  <span className="map-legend__state map-legend__state--available">
+                    available
+                  </span>
+                  <span className="map-legend__state map-legend__state--locked">
+                    locked
+                  </span>
+                  <span className="map-legend__state map-legend__state--mastered">
+                    mastered
+                  </span>
+                </div>
               </div>
-              <div className="map-legend__row">
-                <span className="map-legend__line map-legend__line--dashed" />
-                <span>choose your route</span>
-              </div>
-            </div>
-            <div className="map-legend__states">
-              <span className="map-legend__state map-legend__state--available">
-                available
-              </span>
-              <span className="map-legend__state map-legend__state--locked">
-                locked
-              </span>
-              <span className="map-legend__state map-legend__state--mastered">
-                mastered
-              </span>
-            </div>
+            ) : null}
           </div>
-        ) : null}
+        </ReactFlow>
+        <ReshapeBar onSubmit={reshapeMap} />
       </div>
-    </ReactFlow>
+
+      {selectedNode ? (
+        <NodePanel
+          key={selectedNode.id}
+          goal={graph.goal}
+          node={selectedNode.data}
+          prerequisites={prerequisiteLabels}
+          onClose={closeNodePanel}
+          onMasteryChange={handleMasteryChange}
+        />
+      ) : null}
+    </div>
   );
 }
 

@@ -247,17 +247,32 @@ export function computeTerritories(nodes: SkillFlowNode[]): Territory[] {
   });
 }
 
-export function TerritoryLayer({
-  nodes,
-  revealedClusters,
-}: {
-  nodes: SkillFlowNode[];
-  revealedClusters: ReadonlySet<string>;
-}) {
+export function TerritoryLayer({ nodes }: { nodes: SkillFlowNode[] }) {
   const viewportNode = useStore((state) =>
     state.domNode?.querySelector(".react-flow__viewport"),
   );
   const territories = useMemo(() => computeTerritories(nodes), [nodes]);
+  const revealDelaysByCluster = useMemo(() => {
+    const delays = new Map<string, number>();
+
+    nodes.forEach((node) => {
+      const nodeDelay = node.data.revealDelayMs ?? 0;
+      delays.set(
+        node.data.cluster,
+        Math.min(
+          delays.get(node.data.cluster) ?? Number.POSITIVE_INFINITY,
+          nodeDelay,
+        ),
+      );
+    });
+
+    return new Map(
+      [...delays].map(([cluster, delay]) => [
+        cluster,
+        Math.max(0, delay - 100),
+      ]),
+    );
+  }, [nodes]);
 
   if (!viewportNode) {
     return null;
@@ -268,11 +283,11 @@ export function TerritoryLayer({
       {territories.map((territory) => (
         <g
           key={territory.cluster}
-          className={`territory${
-            revealedClusters.has(territory.cluster)
-              ? " territory--visible"
-              : ""
-          }`}
+          className="territory"
+          style={{
+            animation: "territory-in 400ms ease-out backwards",
+            animationDelay: `${revealDelaysByCluster.get(territory.cluster) ?? 0}ms`,
+          }}
         >
           <path
             d={territory.path}
