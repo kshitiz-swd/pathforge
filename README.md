@@ -119,6 +119,6 @@ progress · more explicit alternative-route generation · dark mode
 
 ## Credits
 
-Built solo by [Kshitij Srivastava](https://github.com/kshitiz-swd) for the
-OpenAI × NamasteDev Codex Hackathon, July 2026. Graph rendering by React
-Flow, layout by elkjs, type set in Newsreader.
+Built solo by [Kshitij Srivastava](https://kshitijcodes.in/) for the OpenAI × NamasteDev
+Codex Hackathon, July 2026. Graph rendering by React Flow, layout by
+elkjs, type set in Newsreader.
