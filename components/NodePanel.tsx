@@ -63,7 +63,7 @@ export function NodePanel({
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    const controller = new AbortController();
+    let isActive = true;
 
     async function loadContent() {
       try {
@@ -77,7 +77,6 @@ export function NodePanel({
             description: node.description,
             prerequisites,
           }),
-          signal: controller.signal,
         });
         const payload: unknown = await response.json();
 
@@ -85,9 +84,11 @@ export function NodePanel({
           throw new Error(getResponseError(payload));
         }
 
-        setContent(NodeContentSchema.parse(payload));
+        if (isActive) {
+          setContent(NodeContentSchema.parse(payload));
+        }
       } catch (requestError) {
-        if (controller.signal.aborted) {
+        if (!isActive) {
           return;
         }
 
@@ -97,14 +98,16 @@ export function NodePanel({
             : "Failed to generate learning content.",
         );
       } finally {
-        if (!controller.signal.aborted) {
+        if (isActive) {
           setIsLoading(false);
         }
       }
     }
 
     void loadContent();
-    return () => controller.abort();
+    return () => {
+      isActive = false;
+    };
   }, [goal, node.id, node.label, node.description, prerequisites]);
 
   useEffect(() => {

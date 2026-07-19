@@ -51,7 +51,11 @@ const EDGE_DURATION = 300;
 const EDGE_DELAY = 200;
 const MAX_NODE_JITTER = 60;
 const RESHAPE_STAGGER = 150;
-const MANY_STATE_CHANGES = 4;
+const MOBILE_QUERY = "(max-width: 640px)";
+const MOBILE_VISIBLE_NODE_COUNT = 2.5;
+const MOBILE_MIN_ZOOM = 0.45;
+const MOBILE_MAX_ZOOM = 0.8;
+const MOBILE_TOP_INSET = 88;
 const MASTERY_STORAGE_PREFIX = "pathforge:mastered:";
 
 function getMasteryStorageKey(goal: string): string {
@@ -147,7 +151,54 @@ function getNodeLayers(nodes: SkillFlowNode[]): SkillFlowNode[][] {
   return goalNode ? [...nonGoalLayers, [goalNode]] : nonGoalLayers;
 }
 
+function setMobileInitialViewport(
+  instance: ReactFlowInstance<SkillFlowNodeData, SkillFlowEdge["data"]>,
+  nodes: SkillFlowNode[],
+  viewportWidth: number,
+  duration: number,
+) {
+  const firstLayer = getNodeLayers(nodes)[0];
+  if (!firstLayer || viewportWidth <= 0) {
+    return;
+  }
+
+  const firstLayerBounds = {
+    left: Math.min(...firstLayer.map((node) => node.position.x)),
+    right: Math.max(
+      ...firstLayer.map((node) => node.position.x + NODE_WIDTH),
+    ),
+    top: Math.min(...firstLayer.map((node) => node.position.y)),
+    bottom: Math.max(
+      ...firstLayer.map((node) => node.position.y + NODE_HEIGHT),
+    ),
+  };
+  const graphLeft = Math.min(...nodes.map((node) => node.position.x));
+  const graphRight = Math.max(
+    ...nodes.map((node) => node.position.x + NODE_WIDTH),
+  );
+  const graphCenterX = (graphLeft + graphRight) / 2;
+  const zoom = Math.min(
+    MOBILE_MAX_ZOOM,
+    Math.max(
+      MOBILE_MIN_ZOOM,
+      viewportWidth / (NODE_WIDTH * MOBILE_VISIBLE_NODE_COUNT),
+    ),
+  );
+  const firstLayerCenterY =
+    (firstLayerBounds.top + firstLayerBounds.bottom) / 2;
+
+  instance.setViewport(
+    {
+      x: viewportWidth / 2 - graphCenterX * zoom,
+      y: MOBILE_TOP_INSET - firstLayerCenterY * zoom,
+      zoom,
+    },
+    { duration },
+  );
+}
+
 function BloomMap({ graph }: { graph: SkillFlowGraph }) {
+  const [isMobile] = useState(() => window.matchMedia(MOBILE_QUERY).matches);
   const [bloomTiming] = useState(() => {
     const nodeDelays = new Map<string, number>();
 
@@ -196,13 +247,16 @@ function BloomMap({ graph }: { graph: SkillFlowGraph }) {
       },
     })),
   );
-  const [isLegendExpanded, setIsLegendExpanded] = useState(true);
+  const [isLegendExpanded, setIsLegendExpanded] = useState(
+    () => !isMobile,
+  );
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const flowInstance = useRef<
     ReactFlowInstance<SkillFlowNodeData, SkillFlowEdge["data"]> | undefined
   >(undefined);
   const selectedNodeIdRef = useRef<string | null>(null);
   const reshapeTimeouts = useRef<number[]>([]);
+  const mapCanvasRef = useRef<HTMLDivElement>(null);
   const selectedNode = useMemo(
     () => nodes.find((node) => node.id === selectedNodeId),
     [nodes, selectedNodeId],
@@ -382,10 +436,10 @@ function BloomMap({ graph }: { graph: SkillFlowGraph }) {
       }, index * RESHAPE_STAGGER),
     );
 
-    if (orderedChanges.length >= MANY_STATE_CHANGES) {
+    if (!isMobile) {
       reshapeTimeouts.current.push(
         window.setTimeout(() => {
-          flowInstance.current?.fitView({ padding: 0.15, duration: 650 });
+          flowInstance.current?.fitView({ padding: 0.1, duration: 650 });
         }, orderedChanges.length * RESHAPE_STAGGER + 250),
       );
     }
@@ -406,28 +460,42 @@ function BloomMap({ graph }: { graph: SkillFlowGraph }) {
     ).matches;
     const fitViewTimeout = window.setTimeout(
       () => {
-        if (!selectedNodeIdRef.current) {
-          flowInstance.current?.fitView({
-            padding: 0.15,
-            duration: prefersReducedMotion ? 0 : 650,
-          });
+        const instance = flowInstance.current;
+        if (!selectedNodeIdRef.current && instance) {
+          const duration = prefersReducedMotion ? 0 : 650;
+
+          if (isMobile) {
+            setMobileInitialViewport(
+              instance,
+              graph.nodes,
+              mapCanvasRef.current?.clientWidth ?? window.innerWidth,
+              duration,
+            );
+          } else {
+            instance.fitView({ padding: 0.1, duration });
+          }
         }
       },
       prefersReducedMotion ? 0 : bloomTiming.completeAt,
     );
 
     return () => window.clearTimeout(fitViewTimeout);
-  }, [bloomTiming.completeAt]);
+  }, [bloomTiming.completeAt, graph.nodes, isMobile]);
 
   return (
     <div className="map-shell">
-      <div className="map-canvas">
+      <div
+        ref={mapCanvasRef}
+        className={`map-canvas${selectedNode ? " map-canvas--panel-open" : ""}`}
+      >
         <ReactFlow
           nodes={nodes}
           edges={edges}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
-          fitView
+          fitView={!isMobile}
+          fitViewOptions={{ padding: 0.1 }}
+          minZoom={0.1}
           panOnDrag
           zoomOnScroll
           proOptions={proOptions}

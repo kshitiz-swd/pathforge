@@ -337,8 +337,16 @@ body {
 
 @media (max-width: 640px) {
   .landing-screen {
+    box-sizing: border-box;
     padding-left: 18px;
     padding-right: 18px;
+  }
+
+  .landing-input-group,
+  .landing-examples {
+    box-sizing: border-box;
+    max-width: 100%;
+    width: calc(100% - 36px);
   }
 
   .landing-input {
@@ -1184,6 +1192,73 @@ body {
   color: var(--ink-muted);
   font-size: 12px;
   line-height: 1.5;
+}
+
+@media (max-width: 640px) {
+  .map-canvas--panel-open {
+    pointer-events: none;
+  }
+
+  .map-legend {
+    align-items: flex-end;
+    background: transparent;
+    border: 0;
+    bottom: 12px;
+    flex-direction: column-reverse;
+    gap: 8px;
+    max-width: 80vw;
+    padding: 0;
+    right: 12px;
+  }
+
+  .map-legend__toggle,
+  .map-legend--collapsed .map-legend__toggle {
+    background: #ffffff;
+    border: 1px solid var(--ink);
+    border-radius: 6px;
+    flex: 0 0 34px;
+    height: 34px;
+    margin: 0;
+    width: 34px;
+  }
+
+  .map-legend__content {
+    background: #ffffff;
+    border: 1px solid var(--ink);
+    border-radius: 6px;
+    box-sizing: border-box;
+    max-width: 80vw;
+    padding: 10px;
+  }
+
+  .map-legend__lines {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .map-legend__states {
+    flex-wrap: wrap;
+  }
+
+  .node-panel {
+    flex-basis: 100%;
+    inset: 0;
+    max-width: none;
+    position: absolute;
+    width: 100%;
+    z-index: 30;
+  }
+
+  .node-panel__header {
+    padding: max(20px, env(safe-area-inset-top)) 18px 18px;
+  }
+
+  .node-panel__close {
+    height: 44px;
+    margin: -8px -8px 0 0;
+    width: 44px;
+  }
 }
 
 @keyframes node-panel-enter {
